@@ -1,0 +1,6 @@
+Example knowledge-base document
+
+This is a sample text file so you can test the RAG pipeline end to end.
+Replace it with your own .txt files. The ingestion script reads text files recursively
+from the data directory, splits them into overlapping chunks, and stores embeddings
+and source metadata in PostgreSQL using pgvector.
