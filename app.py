@@ -10,7 +10,7 @@ from langchain_core.documents import Document
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_ollama import ChatOllama, OllamaEmbeddings
 from langchain_postgres import PGVector
-from document_ingestion import SUPPORTED_EXTENSIONS, index_paths, iter_supported_files
+from document_ingestion import SUPPORTED_EXTENSIONS, index_paths, index_web_urls, iter_supported_files
 
 load_dotenv()
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
@@ -89,7 +89,7 @@ def render_sources(sources: list[tuple[str, str]]) -> None:
 
 def main() -> None:
     st.title("📚 Knowledge Base Assistant")
-    st.caption("Ask questions, upload files, or index everything in your data folder.")
+    st.caption("Ask questions, upload files, or index public web pages.")
     ollama_url = os.getenv("OLLAMA_BASE_URL", "http://192.168.1.200:11434").strip().rstrip("/")
     chat_model = os.getenv("OLLAMA_CHAT_MODEL", "llama3.1").strip()
     embedding_model = os.getenv("OLLAMA_EMBED_MODEL", "nomic-embed-text").strip()
@@ -173,6 +173,22 @@ def main() -> None:
             except Exception as exc:
                 logger.exception("Folder ingestion failed")
                 st.error(f"Folder ingestion failed: {type(exc).__name__}: {exc}")
+
+        st.markdown("#### Add public web pages")
+        st.caption("Paste one http(s) link per line. Pages must be publicly accessible HTML; authenticated portals are not supported.")
+        url_text = st.text_area("Web page URLs", placeholder="https://example.com/help/article")
+        if st.button("Fetch & index links", disabled=not url_text.strip()):
+            urls = [line.strip() for line in url_text.splitlines() if line.strip()]
+            try:
+                with st.spinner(f"Fetching and indexing {len(urls)} web page(s)…"):
+                    results = index_web_urls(urls, connection=connection, ollama_url=ollama_url,
+                        embedding_model=embedding_model, collection=collection)
+                st.success(f"Indexed {len(results)} page(s), {sum(results.values())} chunk(s).")
+                st.cache_resource.clear()
+                st.rerun()
+            except Exception as exc:
+                logger.exception("Web page ingestion failed")
+                st.error(f"Web page ingestion failed: {type(exc).__name__}: {exc}")
 
     if "messages" not in st.session_state:
         st.session_state.messages = []
