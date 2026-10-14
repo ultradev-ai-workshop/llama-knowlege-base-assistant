@@ -1,12 +1,12 @@
 # PostgreSQL + pgvector RAG Knowledge Base
 
-A small, production-minded starter project using LangChain, PostgreSQL/pgvector, OpenAI embeddings, and Streamlit.
+A small RAG starter project using LangChain, PostgreSQL/pgvector, Ollama chat and embeddings, and Streamlit.
 
 ## Requirements
 
 - Python 3.10+
 - PostgreSQL with the `vector` extension enabled
-- OpenAI API key
+- Ollama server with the configured chat and embedding models available
 - PostgreSQL database and credentials with permission to create/use tables and indexes
 
 ## Project layout
@@ -60,7 +60,7 @@ rag_knowledge_base/
 
    Run this as a database administrator if the application database user lacks permission. The extension must be installed on the PostgreSQL server.
 
-5. Put `.txt` files in `data/` (nested folders are supported). An example file is included.
+5. Put supported files in `data/` (nested folders are supported), or use the Streamlit UI to upload files or index public web-page URLs.
 
 6. Ingest files:
 
@@ -78,6 +78,10 @@ rag_knowledge_base/
 
 By default, `source_link` uses a `file://` URI for each local file. Browsers often block local-file navigation from web apps, and `file://` links are not shareable with other users. For clickable, remotely accessible sources, set `SOURCE_BASE_URL` to a document-serving proxy/base URL that maps relative paths to accessible documents. This project does not expose local files over HTTP by itself.
 
+### Public web pages
+
+Use **Add public web pages** in the UI and paste one `http(s)` URL per line. The fetcher indexes HTML text (up to 2 MB per page), follows a limited number of redirects, and rejects hosts resolving to non-public IP addresses. Set `URL_ALLOWED_DOMAINS` to a comma-separated hostname allowlist (for example `example.com,help.example.org`) to restrict sources. Pages behind sign-in and JavaScript-rendered pages are not supported by this basic fetcher. Re-indexing a URL replaces obsolete chunks for that URL. Only index content you are authorized to use.
+
 ## Operational notes
 
 - The ingestion process batches writes and generates deterministic chunk IDs to make repeated ingestion of unchanged content idempotent.
@@ -87,7 +91,7 @@ By default, `source_link` uses a `file://` URI for each local file. Browsers oft
 - Add authentication/authorization in front of Streamlit before exposing it to users.
 - Retrieved text is treated as untrusted input in the prompt. Prompt instructions reduce but do not eliminate prompt-injection risk.
 - File URI links may not open in a browser; use a controlled proxy for production source access.
-- Monitor OpenAI usage and set budgets/rate limits in your OpenAI account.
+- Apply an outbound network policy in deployed environments; application-level URL checks are not a substitute for network egress controls.
 - Consider pinning exact dependency versions after testing in your target environment.
 
 ## Troubleshooting
