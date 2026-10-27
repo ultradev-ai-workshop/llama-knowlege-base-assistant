@@ -2,11 +2,16 @@
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import logging
 import os
+import socket
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, urljoin, urlparse, urlunparse
 from typing import Iterable
+
+import requests
+from bs4 import BeautifulSoup
 
 import pandas as pd
 from dotenv import load_dotenv
@@ -26,6 +31,8 @@ from sqlalchemy import create_engine, text
 load_dotenv()
 logger = logging.getLogger("rag.ingestion")
 BATCH_SIZE = 100
+MAX_URL_BYTES = 2_000_000
+URL_TIMEOUT_SECONDS = 15
 SUPPORTED_EXTENSIONS = {
     ".txt", ".md", ".markdown", ".pdf", ".doc", ".docx",
     ".csv", ".xls", ".xlsx",
@@ -101,6 +108,99 @@ def _old_ids_for_source(connection: str, collection: str, source_path: str) -> l
             }).fetchall()]
     finally:
         engine.dispose()
+
+
+def _validated_public_url(raw_url: str) -> str:
+    """Normalize a public HTTP(S) URL and reject local/private destinations."""
+    parsed = urlparse(raw_url.strip())
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ValueError("Enter a complete http:// or https:// URL.")
+    if parsed.username or parsed.password:
+        raise ValueError("URLs containing embedded credentials are not supported.")
+
+    host = parsed.hostname.rstrip(".").lower()
+    # Optional allowlist: comma-separated hostnames. Subdomains are allowed.
+    allowed = [item.strip().lower().lstrip(".") for item in os.getenv("URL_ALLOWED_DOMAINS", "").split(",") if item.strip()]
+    if allowed and not any(host == domain or host.endswith("." + domain) for domain in allowed):
+        raise ValueError(f"The domain {host!r} is not in URL_ALLOWED_DOMAINS.")
+
+    try:
+        addresses = {item[4][0] for item in socket.getaddrinfo(host, parsed.port or (443 if parsed.scheme == "https" else 80), type=socket.SOCK_STREAM)}
+    except socket.gaierror as exc:
+        raise ValueError(f"Could not resolve URL host {host!r}.") from exc
+    if not addresses or any(not ipaddress.ip_address(address).is_global for address in addresses):
+        raise ValueError("Only publicly reachable web pages can be indexed.")
+
+    return urlunparse((parsed.scheme, parsed.netloc, parsed.path or "/", "", parsed.query, ""))
+
+
+def load_web_page(raw_url: str) -> tuple[str, str]:
+    """Fetch a bounded HTML page and return its title and readable text."""
+    url = _validated_public_url(raw_url)
+    headers = {"User-Agent": "KnowledgeBaseAssistant/1.0 (+URL ingestion)"}
+    for _ in range(6):
+        with requests.get(url, headers=headers, timeout=URL_TIMEOUT_SECONDS, stream=True, allow_redirects=False) as response:
+            if response.is_redirect:
+                location = response.headers.get("Location")
+                if not location:
+                    raise ValueError("The page redirected without a destination.")
+                url = _validated_public_url(urljoin(url, location))
+                continue
+            response.raise_for_status()
+            content_type = response.headers.get("Content-Type", "").lower()
+            if "text/html" not in content_type and "application/xhtml+xml" not in content_type:
+                raise ValueError("The URL must point to an HTML page.")
+            data = bytearray()
+            for block in response.iter_content(64 * 1024):
+                data.extend(block)
+                if len(data) > MAX_URL_BYTES:
+                    raise ValueError("The page is larger than the 2 MB indexing limit.")
+            encoding = response.encoding or "utf-8"
+            html = bytes(data).decode(encoding, errors="replace")
+            break
+    else:
+        raise ValueError("The page redirected too many times.")
+
+    soup = BeautifulSoup(html, "html.parser")
+    title = soup.title.get_text(" ", strip=True) if soup.title else urlparse(url).netloc
+    for element in soup(["script", "style", "noscript", "svg", "nav", "footer", "header"]):
+        element.decompose()
+    main = soup.find("main") or soup.find("article") or soup.body or soup
+    content = main.get_text("\n", strip=True)
+    if not content:
+        raise ValueError("No readable page text was found.")
+    return title[:300], content
+
+
+def index_web_urls(
+    urls: Iterable[str], *, connection: str, ollama_url: str,
+    embedding_model: str, collection: str,
+) -> dict[str, int]:
+    """Fetch and index public HTML pages, replacing old chunks for each URL."""
+    embeddings = OllamaEmbeddings(model=embedding_model, base_url=ollama_url)
+    store = PGVector(embeddings=embeddings, collection_name=collection, connection=connection, use_jsonb=True)
+    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200, add_start_index=True)
+    results: dict[str, int] = {}
+
+    for raw_url in urls:
+        url = _validated_public_url(raw_url)
+        title, content = load_web_page(url)
+        source_id = f"url:{url}"
+        docs = [Document(page_content=content, metadata={
+            "file_name": title, "file_type": "html", "source_path": source_id,
+            "source_link": url, "source_type": "url",
+        })]
+        chunks = splitter.split_documents(docs)
+        ids = [hashlib.sha256((f"{source_id}:{chunk.metadata.get('start_index', 0)}:" + hashlib.sha256(chunk.page_content.encode("utf-8")).hexdigest()).encode("utf-8")).hexdigest() for chunk in chunks]
+        old_ids = _old_ids_for_source(connection, collection, source_id)
+        for offset in range(0, len(chunks), BATCH_SIZE):
+            store.add_documents(documents=chunks[offset:offset + BATCH_SIZE], ids=ids[offset:offset + BATCH_SIZE])
+        obsolete_ids = list(set(old_ids) - set(ids))
+        if obsolete_ids:
+            store.delete(ids=obsolete_ids)
+        results[url] = len(chunks)
+        logger.info("Indexed URL %s: %d chunks (%d obsolete removed)", url, len(chunks), len(obsolete_ids))
+    return results
 
 
 def index_paths(
